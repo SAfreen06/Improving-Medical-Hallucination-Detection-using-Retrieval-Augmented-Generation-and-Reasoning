@@ -18,3 +18,8 @@ tqdm
 
 # Deliberately absent: vllm. It requires a CUDA GPU and is what makes the
 # official repo unrunnable here. See README.
+
+# Frontend: Streamlit dashboard over the dataset, results, judge and RAG pipeline.
+# Run with: streamlit run app.py
+streamlit
+altair

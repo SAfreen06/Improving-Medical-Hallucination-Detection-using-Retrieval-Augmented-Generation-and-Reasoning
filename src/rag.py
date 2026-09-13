@@ -84,6 +84,15 @@ def load_external_corpus(name: str, max_docs: int = 0) -> list[str]:
         print(f"downloading {repo} (first run only)...")
         index = requests.get(
             f"https://huggingface.co/api/datasets/{repo}/parquet", timeout=120).json()
+        if "error" in index or not isinstance(next(iter(index.values()), None), dict):
+            # statpearls in particular: the HF repo ships no data files at all --
+            # StatPearls' licence forbids redistributing the content, so the
+            # dataset card says to build it yourself from NCBI Bookshelf. The
+            # /parquet API then returns {"error": ...} instead of a file index.
+            raise SystemExit(
+                f"{repo} has no downloadable parquet data on HuggingFace "
+                f"(API said: {index!r}). This corpus cannot be fetched automatically; "
+                f"use 'textbooks' instead.")
         config = list(index)[0]
         files = index[config].get("train") or list(index[config].values())[0]
         frames = []
