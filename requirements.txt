@@ -1,0 +1,20 @@
+# Core: dataset, benchmark, metrics, semantic analysis. ~40 MB.
+pandas
+pyarrow
+scikit-learn
+scipy
+requests
+tqdm
+
+# Optional: embedding-based semantic measure (semantics.py --embed).
+# Install torch FIRST from the CPU index, or pip pulls the 2.5 GB CUDA build:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# torch
+# sentence-transformers
+
+# Optional: API judge backends.
+# anthropic
+# openai
+
+# Deliberately absent: vllm. It requires a CUDA GPU and is what makes the
+# official repo unrunnable here. See README.
