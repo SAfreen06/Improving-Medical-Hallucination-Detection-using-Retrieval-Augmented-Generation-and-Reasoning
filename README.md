@@ -134,7 +134,21 @@ results/                Raw per-run dumps from src/ scripts (gitignored, regener
 
 ---
 
-## Two ways to run it
+## Ways to run it
+
+### Streamlit frontend
+
+Explore curated results, inspect individual answers, or run the semantic
+diagnostic from a browser:
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+The frontend uses the Qwen and Llama models tested through Ollama in this
+project. Start Ollama and pull the models before running interactive checks;
+external RAG corpora are downloaded and cached on first use.
 
 ### A. Patch the official MedHallu repo — use this for reportable results
 
