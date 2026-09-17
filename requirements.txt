@@ -5,6 +5,7 @@ scikit-learn
 scipy
 requests
 tqdm
+streamlit
 
 # Optional: embedding-based semantic measure (semantics.py --embed).
 # Install torch FIRST from the CPU index, or pip pulls the 2.5 GB CUDA build:

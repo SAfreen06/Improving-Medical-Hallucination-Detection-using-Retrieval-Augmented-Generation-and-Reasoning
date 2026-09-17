@@ -1,0 +1,589 @@
+#!/usr/bin/env python3
+import gc
+import os
+import random
+import pandas as pd
+from tqdm import tqdm
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+# torch is needed only for the local-GPU path. Importing it unconditionally
+# forces a ~250 MB dependency on a laptop that will only ever call an API.
+try:
+    import torch
+except ImportError:
+    torch = None
+
+# `from datasets import Dataset` was here. It is never referenced anywhere in
+# this file, so it is dropped rather than made optional.
+import multiprocessing
+import ast
+import re
+import json
+
+# vLLM is imported lazily inside the HF branch. At module level it makes the
+# script unimportable on any machine without a CUDA GPU, which is the whole
+# reason this patch exists.
+
+# ===================== CONFIGURATION =====================
+DF_PATH = "medhallu.csv"          # built by make_original_csv.py
+CSV_PATH = "results.csv"
+
+# Conditions to run. Each is (label, knowledge_source, use_cot):
+#   knowledge_source: None = no knowledge, "oracle" = the row's own context,
+#                     "rag" = top-k retrieved passages
+CONDITIONS = [
+    ("baseline", None,     False),   # 1. detection as the paper measures it
+    ("oracle",   "oracle", False),   # 2. the paper's "with knowledge" ceiling
+    ("rag",      "rag",    False),   # 3. real retrieval, external corpus
+    ("cot",      None,     True),    # 4. reasoning, no extra knowledge
+    ("rag+cot",  "rag",    True),    # 5. both
+]
+# Optional diagnostic, not a headline result. Add this row to split rag's
+# shortfall into distractor cost vs missing-passage cost:
+#     ("oracle+rag", "oracle+rag", False),
+
+# Ollama serves an OpenAI-compatible endpoint, so these defaults run the
+# models on THIS machine, free, with no account and no key. Ollama ignores the
+# key but the SDK requires a non-empty string.
+API_KEY = "ollama"
+BASE_URL = "http://localhost:11434/v1"
+
+# Rows to evaluate. The paper uses all 10,000; on a laptop CPU that is days.
+# 200-300 is enough to see whether a mitigation moves the needle.
+LIMIT = 200
+
+
+# CoT variant (Li et al. SS V-A):
+#   "zeroshot"  reason step by step                      Kojima et al.
+#   "fewshot"   worked exemplars first                   Wei et al.
+#   "verify"    reason, then verify each step            Ling et al., Natural Program
+COT_MODE = "zeroshot"
+
+# Self-consistency (Wang et al.): sample N chains per judgement and majority-vote.
+# 1 disables it. Costs N forward passes per judgement -- on a laptop CPU, 5 turns
+# a 3-hour run into 15. Use it on one condition, not all five.
+SELF_CONSISTENCY_N = 1
+
+RAG_K = 3                          # passages to retrieve
+RAG_CORPUS_CSV = None              # defaults to DF_PATH; point elsewhere to add
+                                   # distractors, without which retrieval is
+                                   # near-perfect and rag collapses onto oracle
+# =========================================================
+
+# (If using the OpenAI branch, uncomment and set your API key)
+# import openai
+# openai.api_key = "YOUR_OPENAI_API_KEY"
+
+# ---------------------
+# PROMPT CREATION
+# ---------------------
+system_prompt = """
+You are an AI assistant with extensive knowledge in the field of medicine. I want you act as an answer judge. Given a question and an answer, your objective is to determine if the
+provided answer contains non-factual or hallucinated information. You SHOULD give your judgement based
+on the following hallucination types and the world knowledge.
+
+Type: Misinterpretation of #Question#: These are hallucinated answers that misunderstands the question, leading to an off-topic or irrelevant response.
+Type: Incomplete Information: These are hallucinated answers that Point out what is not true without providing correct information.
+Type: Mechanism and Pathway Misattribution - These are hallucinated answer that falsely attribution of biological mechanisms, molecular pathways, or disease processes that contradicts established medical knowledge
+Type: Methodological and Evidence Fabrication - Inventing false research methods, statistical data, or specific clinical outcomes
+
+
+You are trying to determine if there is a factual contradiction between the answer and the world knowledge.
+Some information in the answer might be fabricated. Answer '0' if the answer is factual and '1' if the answer is hallucinated and `2` if you are unsure about the factuality and want to pass. If you are unsure about the answer choose `2` instead of guessing and making a mistake. Do not return anything else, just the answer.
+"""
+
+def create_prompt(question, option1):
+    prompt = f"""
+Question: {question}
+Answer: {option1}
+
+Reutrn just the answer, Answer '0' if the answer is factual and '1' if the answer is hallucinated and `2` if you are unsure about the answer and want to pass. Dont return anything else, just the answer. Dont be verbose
+If you are unsure about the answer choose `2` instead of guessing and making a mistake.
+Your Judgement:
+"""
+    return prompt
+
+def create_prompt_withknowledge(question, option1, knowledge):
+    prompt = f"""
+World Knowledge: {knowledge}
+Question: {question}
+Answer: {option1}
+
+Reutrn just the answer, Answer '0' if the answer is factual and '1' if the answer is hallucinated and `2` if you are unsure about the answer and want to pass. Dont return anything else, just the answer. Dont be verbose
+If you are unsure about the answer choose `2` instead of guessing and making a mistake.
+Your Judgement:
+"""
+    return prompt
+
+
+
+FINAL_RE = re.compile(r"FINAL\s*:?\s*([012])", re.IGNORECASE)
+
+
+def parse_reply(text, use_cot=False):
+    """Turn a model reply into 0 (factual) / 1 (hallucinated) / 2 (not sure).
+
+    Replaces the original substring test, which had two inversions:
+      - 'not' was checked before 'not sure', so "not sure" scored as
+        hallucinated and the not-sure branch was unreachable
+      - 'non' caught "non-hallucinated" and scored it hallucinated
+
+    With CoT the verdict is the FINAL: line, or failing that the LAST digit.
+    Taking the first digit -- right for terse replies -- is wrong here, because
+    the reasoning is full of digits ("step 1", "type 2 diabetes").
+    """
+    text = (text or "").strip()
+
+    if use_cot:
+        m = FINAL_RE.search(text)
+        if m:
+            return int(m.group(1))
+        digits = re.findall(r"[012]", text)
+        if digits:
+            return int(digits[-1])
+    else:
+        m = re.search(r"[012]", text)
+        if m:
+            return int(m.group())
+
+    low = text.lower()
+    if any(x in low for x in ["not sure", "unsure", "pass", "skip"]):
+        return 2
+    if any(x in low for x in ["not hallucinat", "non-hallucinat",
+                              "not a hallucinat", "factual", "is correct"]):
+        return 0
+    if "hallucinat" in low:
+        return 1
+    return 2
+
+
+# ---------------------------------------------------------------------------
+# Chain-of-Thought variants (Li et al. SS V-A)
+# ---------------------------------------------------------------------------
+
+COT_ZEROSHOT = """
+
+Before answering, reason step by step:
+1. What exactly is the question asking?
+2. What does the world knowledge (if given) actually establish?
+3. Does the answer contradict, overreach beyond, or sidestep that?
+
+Then end your reply with a final line in exactly this form:
+FINAL: <digit>"""
+
+
+# Ling et al. [163]: decompose the reasoning, then verify each sub-conclusion
+# before committing. The verification pass is the point -- a plausible chain
+# that nothing checks is how logic-based hallucinations survive.
+COT_VERIFY = """
+
+Answer in two passes.
+
+PASS 1 - reason:
+1. What exactly is the question asking?
+2. What does the world knowledge (if given) actually establish?
+3. What does the answer claim, broken into separate claims?
+
+PASS 2 - verify each claim from step 3:
+For each one, state VERIFIED if the world knowledge supports it, UNSUPPORTED if
+the knowledge is silent on it, or CONTRADICTED if the knowledge says otherwise.
+An answer with any CONTRADICTED claim is hallucinated. An answer built mainly on
+UNSUPPORTED claims is probably hallucinated.
+
+Then end your reply with a final line in exactly this form:
+FINAL: <digit>"""
+
+
+# Wei et al. [64]: worked exemplars. Both are drawn from MedHallu's own Table 1
+# category definitions, so they demonstrate this task rather than generic
+# reasoning. One hallucinated, one factual -- a single-polarity exemplar set
+# biases the model toward that label.
+COT_FEWSHOT_EXEMPLARS = """
+
+Here are two worked examples.
+
+EXAMPLE 1
+Question: What is the primary mechanism of action of aspirin in reducing inflammation?
+Answer: Aspirin primarily reduces inflammation by blocking calcium channels in
+immune cells, which prevents histamine release and suppresses T-cell activation.
+Reasoning:
+1. The question asks for aspirin's primary anti-inflammatory mechanism.
+2. Established pharmacology: aspirin irreversibly inhibits COX-1 and COX-2,
+   reducing prostaglandin synthesis.
+3. The answer instead asserts calcium-channel blockade and T-cell suppression.
+   That is a different mechanism entirely, and contradicts established knowledge.
+   This is Mechanism and Pathway Misattribution.
+FINAL: 1
+
+EXAMPLE 2
+Question: Does high-dose vitamin C therapy improve survival in sepsis?
+Answer: Trial evidence has been mixed, with several randomised trials showing no
+significant mortality benefit from high-dose vitamin C in sepsis.
+Reasoning:
+1. The question asks whether vitamin C improves sepsis survival.
+2. The answer reports mixed evidence with no significant mortality benefit.
+3. It answers the question that was asked, does not invent a mechanism, and does
+   not fabricate specific figures. It states a limitation rather than
+   overreaching.
+FINAL: 0
+
+Now judge the following the same way."""
+
+
+def build_cot_suffix(mode):
+    """Assemble the CoT instructions for the configured variant."""
+    if mode == "fewshot":
+        return COT_FEWSHOT_EXEMPLARS + COT_ZEROSHOT
+    if mode == "verify":
+        return COT_VERIFY
+    return COT_ZEROSHOT
+
+
+def majority_vote(votes):
+    """Self-consistency aggregation (Wang et al. [164]).
+
+    Abstentions are excluded when any real verdict exists -- a model answering
+    1,1,2 has twice committed to "hallucinated", and letting the abstention
+    outvote that discards information. Ties go to "hallucinated": in a clinical
+    setting, flagging a true answer for review costs less than passing a
+    fabricated one.
+    """
+    committed = [v for v in votes if v != 2]
+    if not committed:
+        return 2
+    return 1 if committed.count(1) * 2 >= len(committed) else 0
+
+
+def create_prompt_cot(question, option1, knowledge=None):
+    """Chain-of-Thought variant (Li et al. SS V-A, zero-shot CoT)."""
+    head = f"World Knowledge: {knowledge}\n" if knowledge else ""
+    return f"""
+{head}Question: {question}
+Answer: {option1}
+
+Reason step by step, then end with 'FINAL: <digit>' -- '0' if factual, '1' if
+hallucinated, '2' if unsure.
+Your Judgement:
+"""
+
+
+# ----------------------------- RAG -----------------------------
+_RAG_CACHE = {}
+
+
+def build_rag_index(corpus_csv):
+    """TF-IDF index over the knowledge passages. Sparse, but it needs no torch,
+    which matters on a laptop. Swap in embeddings if you have the budget.
+    """
+    if corpus_csv in _RAG_CACHE:
+        return _RAG_CACHE[corpus_csv]
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    frame = pd.read_csv(corpus_csv)
+    passages = []
+    for value in frame['knowledge']:
+        try:
+            passages.append(" ".join(ast.literal_eval(value)['contexts']))
+        except Exception:
+            passages.append(str(value))
+    vec = TfidfVectorizer(lowercase=True, stop_words='english', sublinear_tf=True)
+    matrix = vec.fit_transform(passages)
+    _RAG_CACHE[corpus_csv] = (vec, matrix, passages)
+    return _RAG_CACHE[corpus_csv]
+
+
+def retrieve(question, corpus_csv, k):
+    """Top-k passages for a question, joined in rank order."""
+    vec, matrix, passages = build_rag_index(corpus_csv)
+    scores = (vec.transform([question]) @ matrix.T).toarray()[0]
+    top = scores.argsort()[::-1][:k]
+    return "\n\n".join(passages[j] for j in top)
+
+
+# ---------------------
+# GPU MEMORY CLEARING
+# ---------------------
+def clear_gpu_memory():
+    if torch is None:   # API-only run; nothing on a GPU to free
+        return
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+        with torch.cuda.device('cuda'):
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+# ---------------------
+# METRICS CALCULATION
+# ---------------------
+def calculate_metrics(answer_list, llm_answers, df, model_config, use_knowledge, use_cot=False):
+    # Parse llm_answers into integers (0, 1, 2)
+    llm_answers_int = [parse_reply(i, use_cot) for i in llm_answers]
+
+    answer_int = [int(i) for i in answer_list]
+
+    df['llm_answers_int'] = llm_answers_int
+    df['answer_int'] = answer_int
+    df['Decision'] = [
+        'Correct' if llm_answers_int[i] == answer_int[i]
+        else 'Not Sure' if llm_answers_int[i] == 2
+        else 'Incorrect'
+        for i in range(len(llm_answers_int))
+    ]
+
+    # Difficulty-level metrics (filter out "Not Sure" predictions for metric calculation)
+    difficulty_indices = {
+        'easy':   [i for i, diff in enumerate(df['final_difficulty_level']) if diff == 'easy'],
+        'medium': [i for i, diff in enumerate(df['final_difficulty_level']) if diff == 'medium'],
+        'hard':   [i for i, diff in enumerate(df['final_difficulty_level']) if diff == 'hard']
+    }
+
+    metrics = {}
+    for difficulty in ['easy', 'medium', 'hard']:
+        indices = difficulty_indices[difficulty]
+        if not indices:
+            metrics[f'{difficulty}_accuracy']  = None
+            metrics[f'{difficulty}_precision'] = None
+            metrics[f'{difficulty}_recall']    = None
+            metrics[f'{difficulty}_f1']        = None
+            metrics[f'{difficulty}_percent_of_time_not_sure_chosen'] = None
+            continue
+
+        diff_answers = [answer_int[i] for i in indices]
+        diff_llm = [llm_answers_int[i] for i in indices]
+
+        # Calculate percentage of "Not Sure" responses
+        not_sure_count = sum(1 for ans in diff_llm if ans == 2)
+        metrics[f'{difficulty}_percent_of_time_not_sure_chosen'] = (not_sure_count / len(diff_llm))
+
+        # Filter out cases where the model was not sure (i.e., where prediction is 2)
+        valid_idx = [j for j, pred in enumerate(diff_llm) if pred != 2]
+        if valid_idx:
+            filtered_true = [diff_answers[j] for j in valid_idx]
+            filtered_pred = [diff_llm[j] for j in valid_idx]
+            metrics[f'{difficulty}_accuracy']  = accuracy_score(filtered_true, filtered_pred)
+            metrics[f'{difficulty}_precision'] = precision_score(filtered_true, filtered_pred, zero_division=0)
+            metrics[f'{difficulty}_recall']    = recall_score(filtered_true, filtered_pred, zero_division=0)
+            metrics[f'{difficulty}_f1']        = f1_score(filtered_true, filtered_pred, zero_division=0)
+        else:
+            metrics[f'{difficulty}_accuracy']  = None
+            metrics[f'{difficulty}_precision'] = None
+            metrics[f'{difficulty}_recall']    = None
+            metrics[f'{difficulty}_f1']        = None
+
+    # Overall metrics (filtering out "Not Sure" predictions)
+    valid_indices = [i for i, ans in enumerate(llm_answers_int) if ans != 2]
+    if valid_indices:
+        filtered_answers = [answer_int[i] for i in valid_indices]
+        filtered_llm = [llm_answers_int[i] for i in valid_indices]
+        metrics.update({
+            'Model Name': model_config['model_name'],
+            'Knowledge': 'Yes' if use_knowledge else 'No',
+            'precision': precision_score(filtered_answers, filtered_llm, zero_division=0),
+            'recall':    recall_score(filtered_answers, filtered_llm, zero_division=0),
+            'f1':        f1_score(filtered_answers, filtered_llm, zero_division=0)
+        })
+    else:
+        metrics.update({
+            'Model Name': model_config['model_name'],
+            'Knowledge': 'Yes' if use_knowledge else 'No',
+            'precision': 0,
+            'recall': 0,
+            'f1': 0
+        })
+
+    not_sure_total = sum(1 for ans in llm_answers_int if ans == 2)
+    metrics['overall_percent_of_time_not_sure_chosen'] = (not_sure_total / len(llm_answers_int)) if llm_answers_int else None
+
+    return pd.DataFrame([metrics])
+
+# ---------------------
+# EVALUATION FUNCTION
+# ---------------------
+def run_evaluation(model_config, df, use_knowledge=False, use_cot=False):
+    chosen_answer_indices = []
+    prompts = []
+    answer_list = []   # ground-truth 0 or 1 for which answer is chosen
+    
+    for i in range(len(df)):
+        question = df.loc[i, 'question']
+        ground_truth = df.loc[i, 'ground_truth']
+        hallucinated_answer = df.loc[i, 'least_similar_answer']
+        
+        if use_knowledge == "oracle":
+            try:
+                knowledge = ast.literal_eval(df.loc[i, 'knowledge'])['contexts']
+            except Exception:
+                knowledge = ""
+        elif use_knowledge == "rag":
+            knowledge = retrieve(question, RAG_CORPUS_CSV or DF_PATH, RAG_K)
+        else:
+            knowledge = None
+
+        answers = [ground_truth, hallucinated_answer]
+        random_val = random.randint(0, 1)
+        chosen = answers[random_val]
+        answer_list.append(random_val)
+        
+        if use_cot:
+            user_prompt = create_prompt_cot(question, chosen, knowledge)
+        elif knowledge:
+            user_prompt = create_prompt_withknowledge(question, chosen, knowledge)
+        else:
+            user_prompt = create_prompt(question, chosen)
+        
+        sys_prompt = system_prompt + (build_cot_suffix(COT_MODE) if use_cot else "")
+        prompt_chat = [
+            {"role": "user", "content": f"{sys_prompt} {user_prompt}"},
+        ]
+        prompts.append(prompt_chat)
+
+    llm_answers = []
+    
+    if model_config['type'] == 'hf':
+        from vllm import LLM, SamplingParams  # local GPU only
+        # Initialize vLLM model
+        llm = LLM(
+            model=model_config['model_name'],
+            tensor_parallel_size=4,  # adjust based on your GPU setup
+            trust_remote_code=True,
+            gpu_memory_utilization=0.85,
+            dtype=torch.float16,
+        )
+        tokenizer = llm.get_tokenizer()
+        
+        # Determine stop token IDs
+        stop_tok_id = []
+        if tokenizer.eos_token_id is not None:
+            stop_tok_id.append(tokenizer.eos_token_id)
+        for special_token in ["<|eot_id|>", "<|eos_token|>", "<end_of_turn>", "</s>"]:
+            try:
+                sid = tokenizer.convert_tokens_to_ids(special_token)
+                if isinstance(sid, int) and sid not in stop_tok_id:
+                    stop_tok_id.append(sid)
+            except Exception:
+                pass
+
+        sampling_params = SamplingParams(
+            temperature=0.3,
+            top_p=0.95,
+            max_tokens=512,
+            stop_token_ids=stop_tok_id
+        )
+
+        # Format prompts for batch generation
+        batch_formatted_prompts = []
+        for chat_prompt in prompts:
+            formatted_prompt = tokenizer.apply_chat_template(
+                chat_prompt,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            batch_formatted_prompts.append(formatted_prompt)
+        
+        outputs = llm.generate(batch_formatted_prompts, sampling_params)
+        for out in outputs:
+            text = out.outputs[0].text.strip()
+            llm_answers.append(text)
+            
+        # Explicitly delete the model objects to free GPU memory
+        del llm, tokenizer
+        
+    else:
+        # Modern OpenAI SDK (>=1.0). `openai.ChatCompletion.create` was removed;
+        # the original code predates that and raises AttributeError.
+        from openai import OpenAI
+        client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+        # CoT needs room to reason; the terse setting would truncate mid-chain.
+        max_tok = 600 if use_cot else 8
+        n_samples = max(1, SELF_CONSISTENCY_N)
+        # Self-consistency only does anything above temperature 0 -- identical
+        # samples cannot disagree.
+        temp = 0.7 if n_samples > 1 else 0.3
+        for chat_prompt in tqdm(prompts, desc=model_config['model_name']):
+            try:
+                response = client.chat.completions.create(
+                    model=model_config['model_name'],
+                    messages=chat_prompt,
+                    max_tokens=max_tok,
+                    n=n_samples,
+                    temperature=temp,
+                )
+                if n_samples > 1:
+                    votes = [parse_reply(c.message.content.strip(), use_cot)
+                             for c in response.choices]
+                    # Re-encode the voted verdict as text; calculate_metrics
+                    # parses strings, so this keeps one code path.
+                    llm_answers.append(str(majority_vote(votes)))
+                else:
+                    llm_answers.append(response.choices[0].message.content.strip())
+            except Exception as exc:
+                # One bad call should not lose the other 999. An empty reply
+                # parses to "not sure", which is the honest thing to record.
+                print(f"  api error: {exc}")
+                llm_answers.append("")
+    
+    result_df = calculate_metrics(answer_list, llm_answers, df, model_config, use_knowledge, use_cot)
+    return result_df
+
+# ---------------------
+# FUNCTION TO RUN ONE EVALUATION IN A SUBPROCESS
+# ---------------------
+def evaluate_model_subprocess(model_config, use_knowledge, df_path, csv_path, use_cot=False, label=''):
+    try:
+        # Each subprocess loads its own copy of the data
+        df = pd.read_csv(df_path)
+        print(f"Running {model_config['model_name']} with knowledge = {use_knowledge}")
+        result = run_evaluation(model_config, df, use_knowledge, use_cot)
+        result['Condition'] = label
+        # Append results to CSV (create file with header if it does not exist)
+        if os.path.exists(csv_path):
+            result.to_csv(csv_path, mode='a', header=False, index=False)
+        else:
+            result.to_csv(csv_path, mode='w', header=True, index=False)
+    except Exception as e:
+        print(f"Error evaluating {model_config['model_name']} with knowledge={use_knowledge}: {e}")
+    finally:
+        clear_gpu_memory()
+
+# ---------------------
+# MAIN FUNCTION
+# ---------------------
+def main():
+    # Update these paths as needed
+    df_path = DF_PATH
+    csv_path = CSV_PATH
+
+    models = [
+        {'type': 'hf', 'model_name': 'm42-health/Llama3-Med42-8B'},
+        {'type': 'hf', 'model_name': 'OpenMeditron/Meditron3-8B'},
+        {'type': 'hf', 'model_name': 'aaditya/OpenBioLLM-Llama3-8B'},
+        {'type': 'hf', 'model_name': 'BioMistral/BioMistral-7B'},
+        {'type': 'hf', 'model_name': 'TsinghuaC3I/Llama-3.1-8B-UltraMedical'},
+        {'type': 'hf', 'model_name': 'deepseek-ai/DeepSeek-R1-Distill-Llama-8B'},
+        {'type': 'hf', 'model_name': 'Qwen/Qwen2.5-14B-Instruct'},
+        {'type': 'hf', 'model_name': 'google/gemma-2-2b-it'},
+        {'type': 'hf', 'model_name': 'google/gemma-2-9b-it'},
+        {'type': 'hf', 'model_name': 'meta-llama/Llama-3.1-8B-Instruct'},
+        {'type': 'hf', 'model_name': 'meta-llama/Llama-3.2-3B-Instruct'},
+        {'type': 'hf', 'model_name': 'Qwen/Qwen2.5-7B-Instruct'},
+        {'type': 'hf', 'model_name': 'Qwen/Qwen2.5-3B-Instruct'},
+        # {'type': 'openai', 'model_name': 'gpt-4o-mini'}
+    ]
+
+    # For each model, run evaluation without knowledge and with knowledge sequentially in separate processes.
+    for model_config in models:
+        for label, knowledge_source, use_cot in CONDITIONS:
+            print(f"\n=== {model_config['model_name']} | {label} ===")
+            proc = multiprocessing.Process(
+                target=evaluate_model_subprocess,
+                args=(model_config, knowledge_source, df_path, csv_path, use_cot, label)
+            )
+            proc.start()
+            proc.join()  # Wait for the subprocess to finish before moving on
+            print(f"Completed {model_config['model_name']} | {label}\n")
+
+    print(f"All results saved to {csv_path}")
+
+if __name__ == "__main__":
+    main()
